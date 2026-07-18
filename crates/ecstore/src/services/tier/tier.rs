@@ -86,7 +86,6 @@ const EXTERNAL_TIER_TYPE_AZURE: i32 = 2;
 const EXTERNAL_TIER_TYPE_GCS: i32 = 3;
 const EXTERNAL_TIER_TYPE_MINIO: i32 = 4;
 const TIER_BACKEND_IDENTITY_VERSION: u8 = 1;
-
 const _TIER_CFG_REFRESH_AT_HDR: &str = "X-RustFS-TierCfg-RefreshedAt";
 
 lazy_static! {
@@ -130,14 +129,58 @@ type SharedWarmBackend = Arc<dyn WarmBackend + Send + Sync + 'static>;
 #[derive(Default)]
 struct TierDriverRuntime {
     generations: HashMap<String, Arc<TierDriverGeneration>>,
-    draining: HashSet<String>,
+    draining: HashMap<String, u64>,
     next_generation: u64,
+    next_drain_epoch: u64,
     admin_updates: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct TierDriverRegistryEntry {
     manager: Weak<RwLock<TierConfigMgr>>,
     runtime: Arc<Mutex<TierDriverRuntime>>,
+}
+
+struct TierPublishTransition {
+    runtime: Arc<Mutex<TierDriverRuntime>>,
+    tokens: Vec<(String, u64)>,
+    revoked: Vec<Arc<TierDriverGeneration>>,
+    published: bool,
+}
+
+impl TierPublishTransition {
+    async fn wait_for_active_leases(&self) {
+        for generation in &self.revoked {
+            generation.wait_for_no_active_leases().await;
+        }
+    }
+
+    fn tokens_are_current(&self) -> bool {
+        let runtime = lock_unpoisoned(&self.runtime);
+        self.tokens
+            .iter()
+            .all(|(tier_name, epoch)| runtime.draining.get(tier_name) == Some(epoch))
+    }
+}
+
+impl Drop for TierPublishTransition {
+    fn drop(&mut self) {
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        for (tier_name, epoch) in &self.tokens {
+            if runtime.draining.get(tier_name) == Some(epoch) {
+                if !self.published
+                    && !runtime.generations.contains_key(tier_name)
+                    && let Some(generation) = self
+                        .revoked
+                        .iter()
+                        .find(|generation| generation.tier_name.as_ref() == tier_name)
+                {
+                    generation.accepting.store(true, Ordering::Release);
+                    runtime.generations.insert(tier_name.clone(), generation.clone());
+                }
+                runtime.draining.remove(tier_name);
+            }
+        }
+    }
 }
 
 static TIER_DRIVER_REGISTRY: LazyLock<Mutex<HashMap<usize, TierDriverRegistryEntry>>> =
@@ -185,9 +228,11 @@ fn registered_tier_driver_runtime(manager: &TierConfigMgr) -> Option<Arc<Mutex<T
     Some(entry.runtime.clone())
 }
 
-pub(crate) type TierBackendFingerprint = [u8; 32];
+type TierDriverFingerprint = [u8; 32];
+pub(crate) type TierDestinationId = [u8; 32];
+pub(crate) type DriverRevision = u64;
 
-fn tier_config_fingerprint(tier_name: &str, config: &TierConfig) -> io::Result<TierBackendFingerprint> {
+fn tier_config_fingerprint(tier_name: &str, config: &TierConfig) -> io::Result<TierDriverFingerprint> {
     let external = to_external_tier_config(tier_name, config)?;
     let encoded = rmp_serde::to_vec_named(&external)
         .map_err(|err| io::Error::other(format!("serialize tier driver identity failed: {err}")))?;
@@ -212,7 +257,94 @@ pub enum TierConfigUpdateError {
     Publish(AdminError),
 }
 
-fn tier_backend_identity(config: &TierConfig) -> io::Result<TierBackendFingerprint> {
+enum TierCandidateMutation {
+    Add(TierConfig, bool),
+    Edit(String, TierCreds),
+    Remove(String, bool),
+    Clear(bool),
+}
+
+impl TierCandidateMutation {
+    fn target_tiers(&self, manager: &TierConfigMgr, candidate: &TierConfigMgr) -> HashSet<String> {
+        let mut targets = changed_tier_names(manager, candidate);
+        match self {
+            Self::Add(config, _) => {
+                targets.insert(config.name.clone());
+            }
+            Self::Edit(tier_name, _) | Self::Remove(tier_name, _) => {
+                targets.insert(tier_name.clone());
+            }
+            Self::Clear(_) => {
+                targets.extend(manager.tiers.keys().chain(candidate.tiers.keys()).cloned());
+            }
+        }
+        targets
+    }
+
+    async fn apply(self, candidate: &mut TierConfigMgr) -> std::result::Result<Option<String>, AdminError> {
+        match self {
+            Self::Add(config, force) => {
+                let tier_name = config.name.clone();
+                candidate.add(config, force).await?;
+                Ok(Some(tier_name))
+            }
+            Self::Edit(tier_name, credentials) => {
+                candidate.edit(&tier_name, credentials).await?;
+                Ok(Some(tier_name))
+            }
+            Self::Remove(tier_name, _) => {
+                candidate.remove(&tier_name, true).await?;
+                Ok(None)
+            }
+            Self::Clear(_) => {
+                candidate.clear_tier(true).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn ensure_destination_rebind_is_safe(&self, candidate: &mut TierConfigMgr) -> std::result::Result<(), AdminError> {
+        let tier_names = match self {
+            Self::Remove(tier_name, _) => vec![tier_name.clone()],
+            Self::Clear(_) => candidate.tiers.keys().cloned().collect(),
+            Self::Add(_, _) | Self::Edit(_, _) => return Ok(()),
+        };
+        for tier_name in tier_names {
+            let driver = match candidate.get_driver(&tier_name).await {
+                Ok(driver) => driver,
+                Err(err) if err.code == ERR_TIER_NOT_FOUND.code => continue,
+                Err(err) => return Err(err),
+            };
+            match driver.in_use().await {
+                Ok(false) => {}
+                Ok(true) => return Err(ERR_TIER_BACKEND_IN_USE.clone()),
+                Err(err) => {
+                    let mut admin_err = ERR_TIER_PERM_ERR.clone();
+                    admin_err.message.push('.');
+                    admin_err.message.push_str(&err.to_string());
+                    return Err(admin_err);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn changed_tier_names(current: &TierConfigMgr, replacement: &TierConfigMgr) -> HashSet<String> {
+    current
+        .tiers
+        .keys()
+        .chain(replacement.tiers.keys())
+        .filter(|tier_name| match (current.tiers.get(*tier_name), replacement.tiers.get(*tier_name)) {
+            (Some(current), Some(replacement)) => !tier_configs_match(tier_name, current, replacement),
+            (None, None) => false,
+            _ => true,
+        })
+        .cloned()
+        .collect()
+}
+
+fn tier_backend_identity(config: &TierConfig) -> io::Result<TierDestinationId> {
     let (tier_type, endpoint, bucket, prefix, region) = match config.tier_type {
         TierType::S3 => config.s3.as_ref().map(|value| {
             (
@@ -298,23 +430,38 @@ fn tier_backend_identity(config: &TierConfig) -> io::Result<TierBackendFingerpri
         TierType::Unsupported => None,
     }
     .ok_or_else(|| io::Error::other("tier backend identity payload is missing"))?;
-    let prefix = prefix.trim_end_matches('/');
+    let prefix = normalized_tier_prefix(&config.tier_type, prefix);
     let encoded = rmp_serde::to_vec(&(TIER_BACKEND_IDENTITY_VERSION, tier_type, endpoint, bucket, prefix, region))
         .map_err(|err| io::Error::other(format!("serialize tier backend identity failed: {err}")))?;
     Ok(Sha256::digest(encoded).into())
 }
 
+fn normalized_tier_prefix<'a>(tier_type: &TierType, prefix: &'a str) -> &'a str {
+    match tier_type {
+        TierType::S3 => prefix.trim_matches('/'),
+        TierType::RustFS
+        | TierType::MinIO
+        | TierType::Aliyun
+        | TierType::Tencent
+        | TierType::Huaweicloud
+        | TierType::Azure
+        | TierType::GCS
+        | TierType::R2 => prefix.strip_suffix('/').unwrap_or(prefix),
+        TierType::Unsupported => prefix,
+    }
+}
+
 struct TierDriverGeneration {
     tier_name: Arc<str>,
-    generation: u64,
+    generation: DriverRevision,
     // Process-local only: this may reflect credential changes and must never be persisted or logged.
-    config_fingerprint: TierBackendFingerprint,
+    config_fingerprint: TierDriverFingerprint,
     // Durable cleanup identity: routing fields only, with all credentials excluded.
-    backend_identity: TierBackendFingerprint,
+    backend_identity: TierDestinationId,
     driver: SharedWarmBackend,
     accepting: AtomicBool,
     active_leases: AtomicUsize,
-    commit_gate: Arc<RwLock<()>>,
+    drained: tokio::sync::Notify,
 }
 
 struct SharedWarmBackendProxy(SharedWarmBackend);
@@ -358,8 +505,8 @@ pub(crate) struct TierOperationLease {
     runtime: Arc<Mutex<TierDriverRuntime>>,
 }
 
-pub(crate) struct TierCommitPermit {
-    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+pub(crate) struct TierGenerationPin {
+    _lease: TierOperationLease,
 }
 
 impl TierOperationLease {
@@ -381,6 +528,12 @@ impl TierOperationLease {
     pub(crate) fn try_clone(&self) -> std::result::Result<Self, AdminError> {
         Self::try_new(self.inner.clone(), self.runtime.clone())
     }
+
+    pub(crate) fn try_pin(&self) -> std::result::Result<TierGenerationPin, AdminError> {
+        Ok(TierGenerationPin {
+            _lease: self.try_clone()?,
+        })
+    }
 }
 
 impl Drop for TierOperationLease {
@@ -389,12 +542,16 @@ impl Drop for TierOperationLease {
             .inner
             .active_leases
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| active.checked_sub(1));
-        if result.is_err() {
-            error!(
-                tier = self.tier_name(),
-                tier_generation = self.generation(),
-                "tier operation lease counter underflow"
-            );
+        match result {
+            Ok(1) => self.inner.drained.notify_one(),
+            Ok(_) => {}
+            Err(_) => {
+                error!(
+                    tier = self.tier_name(),
+                    tier_generation = self.generation(),
+                    "tier operation lease counter underflow"
+                );
+            }
         }
     }
 }
@@ -412,11 +569,11 @@ impl TierOperationLease {
         &self.inner.tier_name
     }
 
-    pub(crate) fn generation(&self) -> u64 {
+    pub(crate) fn generation(&self) -> DriverRevision {
         self.inner.generation
     }
 
-    pub(crate) fn backend_identity(&self) -> TierBackendFingerprint {
+    pub(crate) fn backend_identity(&self) -> TierDestinationId {
         self.inner.backend_identity
     }
 
@@ -437,25 +594,29 @@ impl TierOperationLease {
                     && Arc::ptr_eq(current, &self.inner)
             })
     }
+}
 
-    pub(crate) async fn acquire_commit_permit(&self, handle: &Arc<RwLock<TierConfigMgr>>) -> Option<TierCommitPermit> {
-        let guard = self.inner.commit_gate.clone().read_owned().await;
-        if !self.is_current(handle).await {
-            return None;
+impl TierDriverGeneration {
+    async fn wait_for_no_active_leases(&self) {
+        loop {
+            let notified = self.drained.notified();
+            if self.active_leases.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
         }
-        Some(TierCommitPermit { _guard: guard })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ExternalTierConfigMgr {
     #[serde(rename = "Tiers")]
     tiers: HashMap<String, ExternalTierConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ExternalTierConfig {
     #[serde(rename = "Version")]
     version: String,
@@ -476,7 +637,7 @@ struct ExternalTierConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ExternalTierS3 {
     #[serde(rename = "Endpoint")]
     endpoint: String,
@@ -505,7 +666,7 @@ struct ExternalTierS3 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ExternalServicePrincipalAuth {
     #[serde(rename = "TenantID")]
     tenant_id: String,
@@ -516,7 +677,7 @@ struct ExternalServicePrincipalAuth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ExternalTierAzure {
     #[serde(rename = "Endpoint")]
     endpoint: String,
@@ -537,7 +698,7 @@ struct ExternalTierAzure {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ExternalTierGcs {
     #[serde(rename = "Endpoint")]
     endpoint: String,
@@ -554,7 +715,7 @@ struct ExternalTierGcs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ExternalTierCompatible {
     #[serde(rename = "Endpoint")]
     endpoint: String,
@@ -1088,6 +1249,7 @@ impl TierConfigMgr {
     }
 
     pub async fn add(&mut self, tier_config: TierConfig, force: bool) -> std::result::Result<(), AdminError> {
+        self.ensure_generation_is_idle(&tier_config.name)?;
         let tier_name = tier_config.name.clone();
         if tier_name != tier_name.to_uppercase() {
             return Err(ERR_TIER_NAME_NOT_UPPERCASE.clone());
@@ -1144,6 +1306,7 @@ impl TierConfigMgr {
     }
 
     pub async fn remove(&mut self, tier_name: &str, force: bool) -> std::result::Result<(), AdminError> {
+        self.ensure_generation_is_idle(tier_name)?;
         let d = self.get_driver(tier_name).await;
         if let Err(err) = d {
             if err.code == ERR_TIER_NOT_FOUND.code {
@@ -1169,9 +1332,7 @@ impl TierConfigMgr {
             }
         }
         self.tiers.remove(tier_name);
-        if let Some(generation) = self.revoke_driver(tier_name) {
-            let _drained = generation.commit_gate.clone().write_owned().await;
-        }
+        self.revoke_driver(tier_name);
         Ok(())
     }
 
@@ -1220,6 +1381,7 @@ impl TierConfigMgr {
     }
 
     pub async fn edit(&mut self, tier_name: &str, creds: TierCreds) -> std::result::Result<(), AdminError> {
+        self.ensure_generation_is_idle(tier_name)?;
         let (tier_type, exists) = self.is_tier_name_in_use(tier_name);
         if !exists {
             return Err(ERR_TIER_NOT_FOUND.clone());
@@ -1317,15 +1479,19 @@ impl TierConfigMgr {
         }
 
         let d = new_warm_backend(&tier_config, true).await?;
-        if let Some(generation) = self.revoke_driver(tier_name) {
-            let _drained = generation.commit_gate.clone().write_owned().await;
-        }
+        self.revoke_driver(tier_name);
         self.tiers.insert(tier_name.to_string(), tier_config);
         self.replace_driver(tier_name, d)?;
         Ok(())
     }
 
     pub async fn get_driver<'a>(&'a mut self, tier_name: &str) -> std::result::Result<&'a WarmBackendImpl, AdminError> {
+        if registered_tier_driver_runtime(self).is_some_and(|runtime| lock_unpoisoned(&runtime).draining.contains_key(tier_name))
+        {
+            let mut err = ERR_TIER_INVALID_CONFIG.clone();
+            err.message = "Remote tier configuration is being replaced".to_string();
+            return Err(err);
+        }
         // Return cached driver if present
         if self.driver_cache.contains_key(tier_name) {
             return Ok(self.driver_cache.get(tier_name).expect("Driver not found in cache"));
@@ -1351,7 +1517,7 @@ impl TierConfigMgr {
             let manager = handle.read().await;
             let runtime = tier_driver_runtime(handle, &manager);
             let runtime_guard = lock_unpoisoned(&runtime);
-            if runtime_guard.draining.contains(tier_name) {
+            if runtime_guard.draining.contains_key(tier_name) {
                 let mut err = ERR_TIER_INVALID_CONFIG.clone();
                 err.message = "Remote tier configuration is being replaced".to_string();
                 return Err(err);
@@ -1362,14 +1528,15 @@ impl TierConfigMgr {
                 .filter(|generation| generation.accepting.load(Ordering::Acquire))
                 .cloned()
             {
+                let lease = TierOperationLease::try_new(generation, runtime.clone());
                 drop(runtime_guard);
-                return TierOperationLease::try_new(generation, runtime);
+                return lease;
             }
         }
 
         let mut manager = handle.write().await;
         let runtime = tier_driver_runtime(handle, &manager);
-        if lock_unpoisoned(&runtime).draining.contains(tier_name) {
+        if lock_unpoisoned(&runtime).draining.contains_key(tier_name) {
             let mut err = ERR_TIER_INVALID_CONFIG.clone();
             err.message = "Remote tier configuration is being replaced".to_string();
             return Err(err);
@@ -1386,65 +1553,175 @@ impl TierConfigMgr {
         update_lock.lock_owned().await
     }
 
+    #[cfg(test)]
     async fn publish_candidate(
+        handle: &Arc<RwLock<Self>>,
+        candidate: Self,
+        driver_tier: Option<&str>,
+    ) -> std::result::Result<(), AdminError> {
+        let update = Self::admin_update_lock(handle).await;
+        Self::publish_candidate_owned(handle, candidate, driver_tier.map(str::to_string), update).await
+    }
+
+    fn begin_publish_transition(
+        handle: &Arc<RwLock<Self>>,
+        manager: &mut Self,
+        candidate: &Self,
+    ) -> std::result::Result<TierPublishTransition, AdminError> {
+        let changed = changed_tier_names(manager, candidate);
+        Self::begin_tier_transition(handle, manager, changed)
+    }
+
+    fn begin_tier_transition(
+        handle: &Arc<RwLock<Self>>,
+        manager: &mut Self,
+        changed: HashSet<String>,
+    ) -> std::result::Result<TierPublishTransition, AdminError> {
+        let runtime = tier_driver_runtime(handle, manager);
+        let count = u64::try_from(changed.len()).map_err(|_| {
+            let mut err = ERR_TIER_INVALID_CONFIG.clone();
+            err.message = "Remote tier replacement count exceeds the supported limit".to_string();
+            err
+        })?;
+        let mut runtime_guard = lock_unpoisoned(&runtime);
+        if changed.iter().any(|tier_name| runtime_guard.draining.contains_key(tier_name)) {
+            let mut err = ERR_TIER_INVALID_CONFIG.clone();
+            err.message = "Remote tier configuration is already being replaced".to_string();
+            return Err(err);
+        }
+        let final_epoch = runtime_guard.next_drain_epoch.checked_add(count).ok_or_else(|| {
+            let mut err = ERR_TIER_INVALID_CONFIG.clone();
+            err.message = "Remote tier replacement epoch exhausted".to_string();
+            err
+        })?;
+        let mut next_epoch = runtime_guard.next_drain_epoch;
+        let mut tokens = Vec::with_capacity(changed.len());
+        let mut revoked = Vec::new();
+        for tier_name in changed {
+            next_epoch += 1;
+            runtime_guard.draining.insert(tier_name.clone(), next_epoch);
+            tokens.push((tier_name.clone(), next_epoch));
+            if let Some(generation) = runtime_guard.generations.remove(&tier_name) {
+                generation.accepting.store(false, Ordering::Release);
+                revoked.push(generation);
+            }
+        }
+        runtime_guard.next_drain_epoch = final_epoch;
+        drop(runtime_guard);
+        Ok(TierPublishTransition {
+            runtime,
+            tokens,
+            revoked,
+            published: false,
+        })
+    }
+
+    async fn publish_candidate_inner(
+        handle: &Arc<RwLock<Self>>,
+        candidate: Self,
+        driver_tier: Option<&str>,
+    ) -> std::result::Result<(), AdminError> {
+        let transition = {
+            let mut manager = handle.write().await;
+            Self::begin_publish_transition(handle, &mut manager, &candidate)?
+        };
+
+        transition.wait_for_active_leases().await;
+        Self::publish_candidate_after_drain(handle, candidate, driver_tier, transition).await
+    }
+
+    async fn publish_candidate_after_drain(
         handle: &Arc<RwLock<Self>>,
         mut candidate: Self,
         driver_tier: Option<&str>,
+        mut transition: TierPublishTransition,
     ) -> std::result::Result<(), AdminError> {
         let driver = driver_tier.and_then(|tier_name| candidate.driver_cache.remove(tier_name));
-        let (runtime, changed, revoked) = {
-            let mut manager = handle.write().await;
-            let runtime = tier_driver_runtime(handle, &manager);
-            let changed = manager
-                .tiers
-                .keys()
-                .chain(candidate.tiers.keys())
-                .filter(|tier_name| match (manager.tiers.get(*tier_name), candidate.tiers.get(*tier_name)) {
-                    (Some(current), Some(replacement)) => !tier_configs_match(tier_name, current, replacement),
-                    (None, None) => false,
-                    _ => true,
-                })
-                .cloned()
-                .collect::<HashSet<_>>();
-            lock_unpoisoned(&runtime).draining.extend(changed.iter().cloned());
-            let revoked = changed
-                .iter()
-                .filter_map(|tier_name| manager.revoke_driver(tier_name))
-                .collect::<Vec<_>>();
-            (runtime, changed, revoked)
-        };
-
-        for generation in revoked {
-            let _drained = generation.commit_gate.clone().write_owned().await;
-        }
-
         let mut manager = handle.write().await;
-        manager.apply_reloaded_tiers(candidate.tiers).await;
+        if !transition.tokens_are_current() {
+            let mut err = ERR_TIER_INVALID_CONFIG.clone();
+            err.message = "Remote tier replacement ownership was lost before publish".to_string();
+            return Err(err);
+        }
+        for (tier_name, _) in &transition.tokens {
+            manager.revoke_driver(tier_name);
+        }
+        manager.tiers = candidate.tiers;
+        manager.last_refreshed_at = OffsetDateTime::now_utc();
+        transition.published = true;
         let result = if let (Some(tier_name), Some(driver)) = (driver_tier, driver) {
             manager.replace_driver(tier_name, driver)
         } else {
             Ok(())
         };
-        let mut runtime = lock_unpoisoned(&runtime);
-        for tier_name in changed {
-            runtime.draining.remove(&tier_name);
-        }
         result
+    }
+
+    fn publish_task_error(err: tokio::task::JoinError) -> AdminError {
+        error!(error = ?err, "remote tier configuration publish task failed");
+        let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+        admin_err.message = format!("Remote tier configuration publish task failed: {err}");
+        admin_err
     }
 
     async fn publish_candidate_owned(
         handle: &Arc<RwLock<Self>>,
         candidate: Self,
         driver_tier: Option<String>,
+        update: tokio::sync::OwnedMutexGuard<()>,
     ) -> std::result::Result<(), AdminError> {
         let handle = handle.clone();
-        tokio::spawn(async move { Self::publish_candidate(&handle, candidate, driver_tier.as_deref()).await })
+        tokio::spawn(async move {
+            let _update = update;
+            Self::publish_candidate_inner(&handle, candidate, driver_tier.as_deref()).await
+        })
+        .await
+        .map_err(Self::publish_task_error)?
+    }
+
+    async fn update_candidate_owned(
+        handle: &Arc<RwLock<Self>>,
+        api: Arc<ECStore>,
+        mut candidate: Self,
+        version: Option<String>,
+        mutation: TierCandidateMutation,
+        update: tokio::sync::OwnedMutexGuard<()>,
+    ) -> std::result::Result<(), TierConfigUpdateError> {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            let _update = update;
+            let transition = {
+                let mut manager = handle.write().await;
+                let target_tiers = mutation.target_tiers(&manager, &candidate);
+                Self::begin_tier_transition(&handle, &mut manager, target_tiers).map_err(TierConfigUpdateError::Publish)?
+            };
+            transition.wait_for_active_leases().await;
+            mutation
+                .ensure_destination_rebind_is_safe(&mut candidate)
+                .await
+                .map_err(TierConfigUpdateError::Mutation)?;
+            let driver_tier = mutation
+                .apply(&mut candidate)
+                .await
+                .map_err(TierConfigUpdateError::Mutation)?;
+            candidate
+                .save_tiering_config_if_current(api, version.as_deref())
+                .await
+                .map_err(TierConfigUpdateError::Save)?;
+            Self::publish_candidate_after_drain(&handle, candidate, driver_tier.as_deref(), transition)
+                .await
+                .map_err(TierConfigUpdateError::Publish)
+        })
+        .await
+        .map_err(|err| TierConfigUpdateError::Publish(Self::publish_task_error(err)))?
+    }
+
+    pub async fn reload_handle(handle: &Arc<RwLock<Self>>, api: Arc<ECStore>) -> io::Result<()> {
+        let update = Self::admin_update_lock(handle).await;
+        let candidate = load_tier_config(api).await?;
+        Self::publish_candidate_owned(handle, candidate, None, update)
             .await
-            .map_err(|err| {
-                let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
-                admin_err.message = format!("Remote tier configuration publish task failed: {err}");
-                admin_err
-            })?
+            .map_err(io::Error::other)
     }
 
     pub async fn add_and_save(
@@ -1453,22 +1730,12 @@ impl TierConfigMgr {
         tier_config: TierConfig,
         force: bool,
     ) -> std::result::Result<(), TierConfigUpdateError> {
-        let _update = Self::admin_update_lock(handle).await;
-        let tier_name = tier_config.name.clone();
-        let (mut candidate, version) = load_tier_config_for_update(api.clone())
+        let update = Self::admin_update_lock(handle).await;
+        let (candidate, version) = load_tier_config_for_update(api.clone())
             .await
             .map_err(TierConfigUpdateError::Load)?;
-        candidate
-            .add(tier_config, force)
+        Self::update_candidate_owned(handle, api, candidate, version, TierCandidateMutation::Add(tier_config, force), update)
             .await
-            .map_err(TierConfigUpdateError::Mutation)?;
-        candidate
-            .save_tiering_config_if_current(api, version.as_deref())
-            .await
-            .map_err(TierConfigUpdateError::Save)?;
-        Self::publish_candidate_owned(handle, candidate, Some(tier_name))
-            .await
-            .map_err(TierConfigUpdateError::Publish)
     }
 
     pub async fn edit_and_save(
@@ -1477,21 +1744,19 @@ impl TierConfigMgr {
         tier_name: &str,
         credentials: TierCreds,
     ) -> std::result::Result<(), TierConfigUpdateError> {
-        let _update = Self::admin_update_lock(handle).await;
-        let (mut candidate, version) = load_tier_config_for_update(api.clone())
+        let update = Self::admin_update_lock(handle).await;
+        let (candidate, version) = load_tier_config_for_update(api.clone())
             .await
             .map_err(TierConfigUpdateError::Load)?;
-        candidate
-            .edit(tier_name, credentials)
-            .await
-            .map_err(TierConfigUpdateError::Mutation)?;
-        candidate
-            .save_tiering_config_if_current(api, version.as_deref())
-            .await
-            .map_err(TierConfigUpdateError::Save)?;
-        Self::publish_candidate_owned(handle, candidate, Some(tier_name.to_string()))
-            .await
-            .map_err(TierConfigUpdateError::Publish)
+        Self::update_candidate_owned(
+            handle,
+            api,
+            candidate,
+            version,
+            TierCandidateMutation::Edit(tier_name.to_string(), credentials),
+            update,
+        )
+        .await
     }
 
     pub async fn remove_and_save(
@@ -1500,21 +1765,19 @@ impl TierConfigMgr {
         tier_name: &str,
         force: bool,
     ) -> std::result::Result<(), TierConfigUpdateError> {
-        let _update = Self::admin_update_lock(handle).await;
-        let (mut candidate, version) = load_tier_config_for_update(api.clone())
+        let update = Self::admin_update_lock(handle).await;
+        let (candidate, version) = load_tier_config_for_update(api.clone())
             .await
             .map_err(TierConfigUpdateError::Load)?;
-        candidate
-            .remove(tier_name, force)
-            .await
-            .map_err(TierConfigUpdateError::Mutation)?;
-        candidate
-            .save_tiering_config_if_current(api, version.as_deref())
-            .await
-            .map_err(TierConfigUpdateError::Save)?;
-        Self::publish_candidate_owned(handle, candidate, None)
-            .await
-            .map_err(TierConfigUpdateError::Publish)
+        Self::update_candidate_owned(
+            handle,
+            api,
+            candidate,
+            version,
+            TierCandidateMutation::Remove(tier_name.to_string(), force),
+            update,
+        )
+        .await
     }
 
     pub async fn clear_and_save(
@@ -1522,18 +1785,11 @@ impl TierConfigMgr {
         api: Arc<ECStore>,
         force: bool,
     ) -> std::result::Result<(), TierConfigUpdateError> {
-        let _update = Self::admin_update_lock(handle).await;
-        let (mut candidate, version) = load_tier_config_for_update(api.clone())
+        let update = Self::admin_update_lock(handle).await;
+        let (candidate, version) = load_tier_config_for_update(api.clone())
             .await
             .map_err(TierConfigUpdateError::Load)?;
-        candidate.clear_tier(force).await.map_err(TierConfigUpdateError::Mutation)?;
-        candidate
-            .save_tiering_config_if_current(api, version.as_deref())
-            .await
-            .map_err(TierConfigUpdateError::Save)?;
-        Self::publish_candidate_owned(handle, candidate, None)
-            .await
-            .map_err(TierConfigUpdateError::Publish)
+        Self::update_candidate_owned(handle, api, candidate, version, TierCandidateMutation::Clear(force), update).await
     }
 
     pub async fn verify_without_manager_lock(handle: &Arc<RwLock<Self>>, tier_name: &str) -> std::result::Result<(), io::Error> {
@@ -1547,7 +1803,7 @@ impl TierConfigMgr {
     pub(crate) async fn acquire_operation_lease_for_backend_identity(
         handle: &Arc<RwLock<Self>>,
         tier_name: &str,
-        expected: TierBackendFingerprint,
+        expected: TierDestinationId,
     ) -> std::result::Result<TierOperationLease, AdminError> {
         let lease = Self::acquire_operation_lease(handle, tier_name).await?;
         if lease.backend_identity() != expected {
@@ -1596,13 +1852,16 @@ impl TierConfigMgr {
             }
         }
 
-        let generation = lock_unpoisoned(&runtime)
+        let runtime_guard = lock_unpoisoned(&runtime);
+        let generation = runtime_guard
             .generations
             .get(tier_name)
             .filter(|generation| generation.accepting.load(Ordering::Acquire))
             .ok_or_else(|| ERR_TIER_NOT_FOUND.clone())?
             .clone();
-        TierOperationLease::try_new(generation, runtime)
+        let lease = TierOperationLease::try_new(generation, runtime.clone());
+        drop(runtime_guard);
+        lease
     }
 
     fn replace_driver(&mut self, tier_name: &str, driver: WarmBackendImpl) -> std::result::Result<(), AdminError> {
@@ -1647,7 +1906,7 @@ impl TierConfigMgr {
             driver: driver.clone(),
             accepting: AtomicBool::new(true),
             active_leases: AtomicUsize::new(0),
-            commit_gate: Arc::new(RwLock::new(())),
+            drained: tokio::sync::Notify::new(),
         });
 
         if let Some(previous) = runtime_guard.generations.insert(tier_name.to_string(), entry) {
@@ -1679,22 +1938,44 @@ impl TierConfigMgr {
         generation
     }
 
+    fn ensure_generation_is_idle(&self, tier_name: &str) -> std::result::Result<(), AdminError> {
+        let Some(runtime) = registered_tier_driver_runtime(self) else {
+            return Ok(());
+        };
+        let runtime = lock_unpoisoned(&runtime);
+        let blocked = runtime.draining.contains_key(tier_name)
+            || runtime
+                .generations
+                .get(tier_name)
+                .is_some_and(|generation| generation.active_leases.load(Ordering::Acquire) != 0);
+        if blocked {
+            return Err(ERR_TIER_BACKEND_IN_USE.clone());
+        }
+        Ok(())
+    }
+
+    fn ensure_generations_are_idle<'a>(
+        &self,
+        tier_names: impl IntoIterator<Item = &'a String>,
+    ) -> std::result::Result<(), AdminError> {
+        for tier_name in tier_names {
+            self.ensure_generation_is_idle(tier_name)?;
+        }
+        Ok(())
+    }
+
     fn retire_driver(&mut self, tier_name: &str) {
         self.revoke_driver(tier_name);
     }
 
-    fn revoke_all_drivers(&mut self) -> Vec<Arc<TierDriverGeneration>> {
-        let generations = if let Some(runtime) = registered_tier_driver_runtime(self) {
+    fn revoke_all_drivers(&mut self) {
+        if let Some(runtime) = registered_tier_driver_runtime(self) {
             let mut runtime = lock_unpoisoned(&runtime);
-            for generation in runtime.generations.values() {
+            for (_, generation) in runtime.generations.drain() {
                 generation.accepting.store(false, Ordering::Release);
             }
-            runtime.generations.drain().map(|(_, generation)| generation).collect()
-        } else {
-            Vec::new()
-        };
+        }
         self.driver_cache.clear();
-        generations
     }
 
     fn retire_all_drivers(&mut self) {
@@ -1703,12 +1984,15 @@ impl TierConfigMgr {
 
     pub async fn reload(&mut self, api: Arc<ECStore>) -> std::result::Result<(), std::io::Error> {
         let config = load_tier_config(api).await?;
-        self.apply_reloaded_tiers(config.tiers).await;
+        self.apply_reloaded_tiers(config.tiers).map_err(io::Error::other)?;
         self.last_refreshed_at = OffsetDateTime::now_utc();
         Ok(())
     }
 
-    async fn apply_reloaded_tiers(&mut self, tiers: HashMap<String, TierConfig>) {
+    fn apply_reloaded_tiers(&mut self, tiers: HashMap<String, TierConfig>) -> std::result::Result<(), AdminError> {
+        if registered_tier_driver_runtime(self).is_some_and(|runtime| !lock_unpoisoned(&runtime).draining.is_empty()) {
+            return Err(ERR_TIER_BACKEND_IN_USE.clone());
+        }
         let changed_or_removed = self
             .tiers
             .iter()
@@ -1719,23 +2003,34 @@ impl TierConfigMgr {
                 (!unchanged).then(|| tier_name.clone())
             })
             .collect::<Vec<_>>();
-        let revoked = changed_or_removed
-            .iter()
-            .filter_map(|tier_name| self.revoke_driver(tier_name))
-            .collect::<Vec<_>>();
-        for generation in revoked {
-            let _drained = generation.commit_gate.clone().write_owned().await;
+        self.ensure_generations_are_idle(&changed_or_removed)?;
+        for tier_name in &changed_or_removed {
+            self.revoke_driver(tier_name);
         }
         self.tiers = tiers;
+        Ok(())
     }
 
     pub async fn rollback_after_failed_save(&mut self, api: Arc<ECStore>) -> io::Result<()> {
         match load_tier_config(api).await {
             Ok(config) => {
-                self.apply_reloaded_tiers(config.tiers).await;
+                self.apply_reloaded_tiers(config.tiers).map_err(io::Error::other)?;
                 Ok(())
             }
             Err(err) => {
+                if let Some(runtime) = registered_tier_driver_runtime(self) {
+                    let runtime = lock_unpoisoned(&runtime);
+                    if !runtime.draining.is_empty()
+                        || runtime
+                            .generations
+                            .values()
+                            .any(|generation| generation.active_leases.load(Ordering::Acquire) != 0)
+                    {
+                        return Err(io::Error::other(format!(
+                            "failed to reload tier configuration for rollback while a tier generation is active: {err}"
+                        )));
+                    }
+                }
                 self.retire_all_drivers();
                 self.tiers.clear();
                 Err(err)
@@ -1744,11 +2039,12 @@ impl TierConfigMgr {
     }
 
     pub async fn clear_tier(&mut self, force: bool) -> std::result::Result<(), AdminError> {
-        self.tiers.clear();
-        let generations = self.revoke_all_drivers();
-        for generation in generations {
-            let _drained = generation.commit_gate.clone().write_owned().await;
+        if registered_tier_driver_runtime(self).is_some_and(|runtime| !lock_unpoisoned(&runtime).draining.is_empty()) {
+            return Err(ERR_TIER_BACKEND_IN_USE.clone());
         }
+        self.ensure_generations_are_idle(self.tiers.keys())?;
+        self.tiers.clear();
+        self.revoke_all_drivers();
         Ok(())
     }
 
@@ -2569,6 +2865,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_remove_preflight_rejects_in_use_backend_even_when_forced() {
+        let mut candidate = empty_mgr();
+        inject_mock(
+            &mut candidate,
+            "COLD-A",
+            build_s3_tier("COLD-A"),
+            MockWarmBackend {
+                in_use_value: Some(true),
+                healthy: true,
+            },
+        );
+        let mutation = TierCandidateMutation::Remove("COLD-A".to_string(), true);
+
+        let err = mutation
+            .ensure_destination_rebind_is_safe(&mut candidate)
+            .await
+            .expect_err("persisted removal must preserve tier-name-only objects");
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+    }
+
+    #[tokio::test]
     async fn test_remove_reports_probe_error() {
         let mut mgr = empty_mgr();
         inject_mock(
@@ -2776,6 +3093,34 @@ mod tests {
         data.extend_from_slice(&[0u8; 8]);
         let err = expect_decode_err(&data);
         assert!(err.to_string().contains("unknown version"), "{err}");
+    }
+
+    #[test]
+    fn test_external_blob_rejects_misspelled_prefix() {
+        let payload = serde_json::json!({
+            "Tiers": {
+                "COLD-A": {
+                    "Version": "v1",
+                    "Type": EXTERNAL_TIER_TYPE_S3,
+                    "Name": "COLD-A",
+                    "S3": {
+                        "Endpoint": "https://example.invalid",
+                        "AccessKey": "ak",
+                        "SecretKey": "sk",
+                        "Bucket": "bucket",
+                        "Prefx": "objects"
+                    }
+                }
+            }
+        });
+        let encoded = rmp_serde::to_vec(&payload).expect("test payload should encode");
+        let mut data = Vec::with_capacity(4 + encoded.len());
+        data.extend_from_slice(&TIER_CONFIG_FORMAT.to_le_bytes());
+        data.extend_from_slice(&TIER_CONFIG_VERSION.to_le_bytes());
+        data.extend_from_slice(&encoded);
+
+        let err = expect_decode_err(&data);
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]
@@ -3005,7 +3350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_waits_for_inflight_transition_commit_permit() {
+    async fn replacement_waits_for_inflight_operation_lease() {
         let manager = TierConfigMgr::new();
         {
             let mut guard = manager.write().await;
@@ -3014,11 +3359,6 @@ mod tests {
         let old = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
             .await
             .expect("old lease should be available");
-        let permit = old
-            .acquire_commit_permit(&manager)
-            .await
-            .expect("current generation should grant a commit permit");
-
         let mut candidate = empty_mgr();
         let mut config = build_rustfs_tier("COLD-A");
         config.rustfs.as_mut().expect("rustfs payload should exist").endpoint = "https://replacement.invalid".to_string();
@@ -3037,17 +3377,16 @@ mod tests {
         })
         .await
         .expect("replacement should revoke the old generation before waiting");
-        assert!(!publish.is_finished(), "replacement must wait for the old commit permit");
-        drop(permit);
+        assert!(!publish.is_finished(), "replacement must wait for the old operation lease");
+        drop(old);
         publish
             .await
             .expect("publish task should join")
-            .expect("replacement should publish after the permit drains");
-        assert!(!old.is_current(&manager).await);
+            .expect("replacement should publish after the lease drains");
     }
 
     #[tokio::test]
-    async fn reload_waits_for_inflight_transition_commit_permit() {
+    async fn durable_generation_pin_blocks_replacement_after_operation_lease_drops() {
         let manager = TierConfigMgr::new();
         {
             let mut guard = manager.write().await;
@@ -3056,25 +3395,63 @@ mod tests {
         let old = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
             .await
             .expect("old lease should be available");
-        let permit = old
-            .acquire_commit_permit(&manager)
+        let pin = old.try_pin().expect("durable transaction should pin its generation");
+        let mut candidate = empty_mgr();
+        let mut config = build_rustfs_tier("COLD-A");
+        config.rustfs.as_mut().expect("rustfs payload should exist").endpoint = "https://replacement.invalid".to_string();
+        candidate.tiers.insert("COLD-A".to_string(), config);
+        candidate
+            .driver_cache
+            .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("new")));
+        let publish_manager = manager.clone();
+        let publish =
+            tokio::spawn(async move { TierConfigMgr::publish_candidate(&publish_manager, candidate, Some("COLD-A")).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while old.is_current(&manager).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement should revoke before waiting");
+        drop(old);
+        assert!(!publish.is_finished(), "replacement must wait for the durable transaction pin");
+        drop(pin);
+        publish
             .await
-            .expect("current generation should grant a commit permit");
+            .expect("publish task should join")
+            .expect("replacement should publish after the durable pin is released");
+    }
+
+    #[tokio::test]
+    async fn reload_publish_waits_for_inflight_operation_lease() {
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
+        let old = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+            .await
+            .expect("old lease should be available");
         let mut replacement = build_rustfs_tier("COLD-A");
         replacement.rustfs.as_mut().expect("rustfs payload should exist").endpoint = "https://reload.invalid".to_string();
+        let mut candidate = empty_mgr();
+        candidate.tiers.insert("COLD-A".to_string(), replacement);
         let reload_manager = manager.clone();
-        let reload = tokio::spawn(async move {
-            reload_manager
-                .write()
-                .await
-                .apply_reloaded_tiers(HashMap::from([("COLD-A".to_string(), replacement)]))
-                .await;
-        });
-        tokio::task::yield_now().await;
-        assert!(!reload.is_finished(), "reload must wait for the old commit permit");
-        drop(permit);
-        reload.await.expect("reload task should join");
-        assert!(!old.is_current(&manager).await);
+        let reload = tokio::spawn(async move { TierConfigMgr::publish_candidate(&reload_manager, candidate, None).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while old.is_current(&manager).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reload publish should revoke before waiting");
+        assert!(!reload.is_finished(), "reload must wait for the old operation lease");
+        drop(old);
+        reload
+            .await
+            .expect("reload task should join")
+            .expect("reload should publish after the lease drains");
     }
 
     #[tokio::test]
@@ -3087,10 +3464,6 @@ mod tests {
         let old = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
             .await
             .expect("old lease should be available");
-        let permit = old
-            .acquire_commit_permit(&manager)
-            .await
-            .expect("current generation should grant a commit permit");
         let mut candidate = empty_mgr();
         let mut config = build_rustfs_tier("COLD-A");
         config.rustfs.as_mut().expect("rustfs payload should exist").endpoint = "https://owned.invalid".to_string();
@@ -3098,9 +3471,10 @@ mod tests {
         candidate
             .driver_cache
             .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("new")));
+        let update = TierConfigMgr::admin_update_lock(&manager).await;
         let publish_manager = manager.clone();
         let caller = tokio::spawn(async move {
-            TierConfigMgr::publish_candidate_owned(&publish_manager, candidate, Some("COLD-A".to_string())).await
+            TierConfigMgr::publish_candidate_owned(&publish_manager, candidate, Some("COLD-A".to_string()), update).await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while old.is_current(&manager).await {
@@ -3110,20 +3484,148 @@ mod tests {
         .await
         .expect("owned publish should revoke before caller cancellation");
         caller.abort();
-        drop(permit);
+
+        let mut second = empty_mgr();
+        let mut second_config = build_rustfs_tier("COLD-A");
+        second_config.rustfs.as_mut().expect("rustfs payload should exist").endpoint = "https://second.invalid".to_string();
+        second.tiers.insert("COLD-A".to_string(), second_config);
+        second
+            .driver_cache
+            .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("second")));
+        let second_manager = manager.clone();
+        let second_publish =
+            tokio::spawn(async move { TierConfigMgr::publish_candidate(&second_manager, second, Some("COLD-A")).await });
+        tokio::task::yield_now().await;
+        assert!(!second_publish.is_finished(), "a later update must remain behind the detached publish");
+
+        drop(old);
+        second_publish
+            .await
+            .expect("second publish task should join")
+            .expect("second publish should follow the detached publish");
+        let endpoint = manager
+            .read()
+            .await
+            .tiers
+            .get("COLD-A")
+            .and_then(|tier| tier.rustfs.as_ref())
+            .expect("second tier should be published")
+            .endpoint
+            .clone();
+        assert_eq!(endpoint, "https://second.invalid");
+    }
+
+    #[tokio::test]
+    async fn slow_tier_replacement_does_not_block_other_tiers_or_manager_reads() {
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("a"));
+            install_lease_backend(&mut guard, "COLD-B", LeaseTestBackend::ready("b"));
+        }
+        let old_a = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+            .await
+            .expect("tier A lease should be available");
+        let old_b = TierConfigMgr::acquire_operation_lease(&manager, "COLD-B")
+            .await
+            .expect("tier B lease should be available");
+        let mut candidate = empty_mgr();
+        candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        candidate.tiers.insert("COLD-B".to_string(), build_rustfs_tier("COLD-B"));
+        candidate
+            .tiers
+            .get_mut("COLD-A")
+            .and_then(|tier| tier.rustfs.as_mut())
+            .expect("tier A payload should exist")
+            .endpoint = "https://replacement.invalid".to_string();
+        candidate
+            .driver_cache
+            .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("new-a")));
+        let publish_manager = manager.clone();
+        let publish =
+            tokio::spawn(async move { TierConfigMgr::publish_candidate(&publish_manager, candidate, Some("COLD-A")).await });
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let Ok(lease) = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await
-                    && lease.generation() != old.generation()
-                {
-                    break;
-                }
+            while old_a.is_current(&manager).await {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("owned publish must complete after its caller is cancelled");
+        .expect("tier A should enter draining");
+        {
+            let guard = manager.read().await;
+            let runtime = registered_tier_driver_runtime(&guard).expect("runtime should remain registered");
+            assert_eq!(
+                lock_unpoisoned(&runtime).draining.keys().cloned().collect::<Vec<_>>(),
+                vec!["COLD-A".to_string()]
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), manager.read())
+            .await
+            .expect("manager reads must not wait for tier A leases");
+        let next_b = tokio::time::timeout(Duration::from_secs(1), TierConfigMgr::acquire_operation_lease(&manager, "COLD-B"))
+            .await
+            .expect("tier B lease acquisition must not wait for tier A")
+            .expect("tier B lease should remain available");
+        assert_eq!(next_b.generation(), old_b.generation());
+        assert!(!publish.is_finished(), "tier A replacement should still wait for its lease");
+
+        drop(old_a);
+        publish
+            .await
+            .expect("publish task should join")
+            .expect("tier A replacement should publish after its lease drains");
+    }
+
+    #[tokio::test]
+    async fn publish_panic_clears_only_its_draining_epoch() {
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
+        let old = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+            .await
+            .expect("old lease should be available");
+        let mut candidate = empty_mgr();
+        let mut replacement = build_rustfs_tier("COLD-A");
+        replacement.rustfs.as_mut().expect("rustfs payload should exist").endpoint = "https://panic.invalid".to_string();
+        candidate.tiers.insert("COLD-A".to_string(), replacement);
+        let transition = {
+            let mut guard = manager.write().await;
+            TierConfigMgr::begin_publish_transition(&manager, &mut guard, &candidate).expect("transition should begin")
+        };
+        let task = tokio::spawn(async move {
+            let _transition = transition;
+            panic!("simulated publish panic");
+        });
+        assert!(task.await.is_err(), "panic should be contained by the detached task boundary");
+        assert!(old.is_current(&manager).await, "a failed publish must restore the revoked generation");
+        let guard = manager.read().await;
+        let runtime = registered_tier_driver_runtime(&guard).expect("runtime should remain registered");
+        assert!(!lock_unpoisoned(&runtime).draining.contains_key("COLD-A"));
+        drop(guard);
+        drop(old);
+    }
+
+    #[tokio::test]
+    async fn direct_mutation_fails_closed_while_generation_is_active() {
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
+        let lease = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+            .await
+            .expect("lease should be available");
+        let err = manager
+            .write()
+            .await
+            .remove("COLD-A", true)
+            .await
+            .expect_err("direct removal must not wait for an active generation");
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+        assert!(lease.is_current(&manager).await);
     }
 
     #[tokio::test]
@@ -3261,7 +3763,11 @@ mod tests {
             .and_then(|tier| tier.rustfs.as_mut())
             .expect("tier B payload should exist")
             .access_key = "rotated".to_string();
-        manager.write().await.apply_reloaded_tiers(reloaded).await;
+        manager
+            .write()
+            .await
+            .apply_reloaded_tiers(reloaded)
+            .expect("unrelated reload should apply");
 
         assert!(lease.is_current(&manager).await);
         let next = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
@@ -3324,8 +3830,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn destination_identity_prefix_normalization_matches_driver_matrix() {
+        assert_eq!(normalized_tier_prefix(&TierType::S3, "/foo//"), "foo");
+        for tier_type in [
+            TierType::RustFS,
+            TierType::MinIO,
+            TierType::Aliyun,
+            TierType::Tencent,
+            TierType::Huaweicloud,
+            TierType::Azure,
+            TierType::GCS,
+            TierType::R2,
+        ] {
+            assert_eq!(normalized_tier_prefix(&tier_type, "foo/"), "foo");
+            assert_eq!(normalized_tier_prefix(&tier_type, "foo//"), "foo/");
+        }
+    }
+
     #[tokio::test]
-    async fn save_failure_rollback_revokes_unpublished_driver_generation() {
+    async fn direct_rollback_fails_closed_until_unpublished_generation_is_idle() {
         let manager = Arc::new(RwLock::new(empty_mgr()));
         {
             let mut guard = manager.write().await;
@@ -3350,9 +3874,20 @@ mod tests {
             .await
             .expect("unpublished lease should be visible before rollback");
 
-        manager.write().await.apply_reloaded_tiers(persisted).await;
+        let err = manager
+            .write()
+            .await
+            .apply_reloaded_tiers(persisted.clone())
+            .expect_err("direct rollback must not wait for an active generation");
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+        assert!(unpublished.is_current(&manager).await);
+        drop(unpublished);
+        manager
+            .write()
+            .await
+            .apply_reloaded_tiers(persisted)
+            .expect("rollback should apply once the generation is idle");
 
-        assert!(!unpublished.is_current(&manager).await);
         let manager_guard = manager.read().await;
         assert_eq!(
             manager_guard

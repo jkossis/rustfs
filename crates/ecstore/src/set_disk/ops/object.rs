@@ -1287,13 +1287,6 @@ impl TransitionUploadCleanup {
         self.armed = false;
     }
 
-    async fn acquire_commit_permit(
-        &self,
-        handle: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
-    ) -> Option<crate::services::tier::tier::TierCommitPermit> {
-        self.lease.acquire_commit_permit(handle).await
-    }
-
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -2621,13 +2614,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 achieved: 0,
             });
         }
-        // Lock order is namespace lock, then a short tier-manager read. Tier-manager
-        // mutation paths never acquire namespace locks, so the reverse edge does not exist.
-        let Some(_commit_permit) = upload_cleanup.acquire_commit_permit(&tier_config_mgr).await else {
+        if !upload_cleanup.lease.is_current(&tier_config_mgr).await {
             drop(transition_lock_guard);
             upload_cleanup.cleanup().await;
             return Err(Error::other("remote tier configuration changed during transition"));
-        };
+        }
         #[cfg(test)]
         pause_transition_before_local_commit(bucket, object).await;
         upload_cleanup.disarm();
