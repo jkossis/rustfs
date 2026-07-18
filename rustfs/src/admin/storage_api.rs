@@ -110,6 +110,7 @@ pub(crate) type Result<T> = core::result::Result<T, Error>;
 pub(crate) type TierConfig = ecstore_tier::tier_config::TierConfig;
 pub(crate) type TierCreds = ecstore_tier::tier_admin::TierCreds;
 pub(crate) type TierType = ecstore_tier::tier_config::TierType;
+pub(crate) type TierConfigUpdateError = crate::storage::storage_api::TierConfigUpdateError;
 
 pub(crate) mod runtime_sources {
     pub(crate) type DailyAllTierStats = super::DailyAllTierStats;

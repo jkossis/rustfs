@@ -23,6 +23,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryOp;
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
 use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
 use crate::client::signer_error::error_chain_contains_signer_header_marker;
+use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::storage_api_contracts::lifecycle::TransitionedObject;
 use crate::store::ECStore;
 use rustfs_utils::get_env_usize;
@@ -307,8 +308,29 @@ pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_na
 }
 
 async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
+    let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
+    delete_object_from_remote_tier_raw_with_manager(obj_name, rv_id, tier_name, &tier_config_mgr).await
+}
+
+async fn delete_object_from_remote_tier_raw_with_manager(
+    obj_name: &str,
+    rv_id: &str,
+    tier_name: &str,
+    tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+) -> Result<(), std::io::Error> {
+    let lease = TierConfigMgr::acquire_operation_lease(&tier_config_mgr, tier_name)
+        .await
+        .map_err(std::io::Error::other)?;
+    delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, &lease).await
+}
+
+async fn delete_object_from_remote_tier_raw_with_lease(
+    obj_name: &str,
+    rv_id: &str,
+    lease: &TierOperationLease,
+) -> Result<(), std::io::Error> {
     #[cfg(test)]
-    if let Some(result) = run_remote_tier_delete_test_hook(obj_name, rv_id, tier_name) {
+    if let Some(result) = run_remote_tier_delete_test_hook(obj_name, rv_id, lease.tier_name()) {
         return result;
     }
 
@@ -323,13 +345,7 @@ async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_na
         .map_err(|_| std::io::Error::other(ERR_REMOTE_DELETE_LIMITER_CLOSED))?;
     let _inflight = RemoteDeleteInflightGuard::new();
 
-    let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
-    let mut config_mgr = tier_config_mgr.write().await;
-    let w = match config_mgr.get_driver(tier_name).await {
-        Ok(w) => w,
-        Err(e) => return Err(std::io::Error::other(e)),
-    };
-    w.remove(obj_name, rv_id).await
+    lease.remove(obj_name, rv_id).await
 }
 
 #[cfg(test)]
@@ -353,6 +369,41 @@ pub async fn delete_object_from_remote_tier_idempotent(
     tier_name: &str,
 ) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
     match delete_object_from_remote_tier_raw(obj_name, rv_id, tier_name).await {
+        Ok(()) => Ok(RemoteTierDeleteOutcome::Deleted),
+        Err(err) if is_remote_tier_not_found_error(&err) => Ok(RemoteTierDeleteOutcome::AlreadyRemoved),
+        Err(err) => {
+            if should_record_remote_delete_failure(&err) {
+                record_remote_delete_failure(&err, Instant::now()).await;
+            }
+            Err(err)
+        }
+    }
+}
+
+pub(crate) async fn delete_object_from_remote_tier_idempotent_with_manager(
+    obj_name: &str,
+    rv_id: &str,
+    tier_name: &str,
+    tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    match delete_object_from_remote_tier_raw_with_manager(obj_name, rv_id, tier_name, tier_config_mgr).await {
+        Ok(()) => Ok(RemoteTierDeleteOutcome::Deleted),
+        Err(err) if is_remote_tier_not_found_error(&err) => Ok(RemoteTierDeleteOutcome::AlreadyRemoved),
+        Err(err) => {
+            if should_record_remote_delete_failure(&err) {
+                record_remote_delete_failure(&err, Instant::now()).await;
+            }
+            Err(err)
+        }
+    }
+}
+
+pub(crate) async fn delete_object_from_remote_tier_with_lease_idempotent(
+    obj_name: &str,
+    rv_id: &str,
+    lease: &TierOperationLease,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    match delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, lease).await {
         Ok(()) => Ok(RemoteTierDeleteOutcome::Deleted),
         Err(err) if is_remote_tier_not_found_error(&err) => Ok(RemoteTierDeleteOutcome::AlreadyRemoved),
         Err(err) => {

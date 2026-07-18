@@ -29,7 +29,7 @@ use crate::bucket::lifecycle::replication_sink::{
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
-use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
+use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager};
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
@@ -38,7 +38,7 @@ use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
-use crate::services::tier::warm_backend::WarmBackendGetOpts;
+use crate::services::tier::{tier::TierConfigMgr, warm_backend::WarmBackendGetOpts};
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::storage_api_contracts::{
     lifecycle::ExpirationOptions,
@@ -680,10 +680,11 @@ impl ExpiryState {
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("FreeVersionTask downcast failed");
                         let oi = v.0.clone();
-                        if let Err(err) = delete_object_from_remote_tier_idempotent(
+                        if let Err(err) = delete_object_from_remote_tier_idempotent_with_manager(
                             &oi.transitioned_object.name,
                             &oi.transitioned_object.version_id,
                             &oi.transitioned_object.tier,
+                            &api.tier_config_mgr(),
                         )
                         .await
                         {
@@ -2444,8 +2445,19 @@ pub async fn get_transitioned_object_reader(
     opts: &ObjectOptions,
 ) -> Result<GetObjectReader, std::io::Error> {
     let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
-    let mut tier_config_mgr = tier_config_mgr.write().await;
-    let tgt_client = match tier_config_mgr.get_driver(&oi.transitioned_object.tier).await {
+    get_transitioned_object_reader_with_tier_manager(bucket, object, rs, h, oi, opts, &tier_config_mgr).await
+}
+
+pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
+    bucket: &str,
+    object: &str,
+    rs: &Option<HTTPRangeSpec>,
+    h: &HeaderMap,
+    oi: &ObjectInfo,
+    opts: &ObjectOptions,
+    tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
+) -> Result<GetObjectReader, std::io::Error> {
+    let tgt_client = match TierConfigMgr::acquire_operation_lease(tier_config_mgr, &oi.transitioned_object.tier).await {
         Ok(d) => d,
         Err(err) => return Err(std::io::Error::other(err)),
     };

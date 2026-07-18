@@ -407,7 +407,7 @@ pub mod tier {
         pub use crate::services::tier::tier::{
             ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_INVALID_CONFIG, ERR_TIER_MISSING_CREDENTIALS,
             ERR_TIER_TYPE_UNSUPPORTED, TIER_CONFIG_FILE, TIER_CONFIG_FORMAT, TIER_CONFIG_V1, TIER_CONFIG_VERSION, TierConfigMgr,
-            is_err_config_not_found, try_migrate_tiering_config,
+            TierConfigUpdateError, is_err_config_not_found, try_migrate_tiering_config,
         };
     }
 

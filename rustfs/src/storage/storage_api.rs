@@ -577,6 +577,7 @@ pub(crate) type ReplicationStatusType = ecstore_bucket::replication::Replication
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
+pub(crate) type TierConfigUpdateError = rustfs_ecstore::api::tier::tier::TierConfigUpdateError;
 pub(crate) use ecstore_disk::validate_batch_read_version_item_count;
 pub(crate) type TransitionState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::TransitionState;
 pub(crate) type Error = ecstore_error::Error;

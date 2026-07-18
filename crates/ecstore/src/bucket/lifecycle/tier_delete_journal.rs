@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::bucket::lifecycle::config_boundary;
-use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
+use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
@@ -148,7 +148,8 @@ where
 }
 
 pub async fn process_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -> std::io::Result<()> {
-    delete_object_from_remote_tier_idempotent(&je.obj_name, &je.version_id, &je.tier_name).await?;
+    delete_object_from_remote_tier_idempotent_with_manager(&je.obj_name, &je.version_id, &je.tier_name, &api.tier_config_mgr())
+        .await?;
     remove_tier_delete_journal_entry(api, je).await
 }
 
