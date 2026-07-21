@@ -786,6 +786,41 @@ message HealControlResponse {
   bytes response_proof = 4;
 }
 
+message TierMutationPrepareRequest {
+  uint32 version = 1;
+  string mutation_id = 2;
+  uint64 revision = 3;
+  bytes topology_fingerprint = 4;
+  bytes intent_record = 5;
+  string intent_record_etag = 6;
+  uint64 deadline_unix_millis = 7;
+}
+
+message TierMutationCommitRequest {
+  uint32 version = 1;
+  string mutation_id = 2;
+  uint64 revision = 3;
+  bytes topology_fingerprint = 4;
+  string committed_config_etag = 5;
+  bytes committed_config_digest = 6;
+  uint64 deadline_unix_millis = 7;
+}
+
+message TierMutationAbortRequest {
+  uint32 version = 1;
+  string mutation_id = 2;
+  uint64 revision = 3;
+  bytes topology_fingerprint = 4;
+  string abort_reason = 5;
+  uint64 deadline_unix_millis = 6;
+}
+
+message TierMutationControlResponse {
+  bool success = 1;
+  optional string error_info = 2;
+  bytes response_proof = 3;
+}
+
 message GetMetacacheListingRequest {
   bytes opts = 1;
 }
@@ -982,4 +1017,10 @@ service NodeService {
 
 service HealControlService {
   rpc HealControl(HealControlRequest) returns (HealControlResponse) {};
+}
+
+service TierMutationControlService {
+  rpc Prepare(TierMutationPrepareRequest) returns (TierMutationControlResponse) {};
+  rpc Commit(TierMutationCommitRequest) returns (TierMutationControlResponse) {};
+  rpc Abort(TierMutationAbortRequest) returns (TierMutationControlResponse) {};
 }

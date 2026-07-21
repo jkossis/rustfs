@@ -35,6 +35,7 @@ use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 // Type alias for the complex client type
 pub type NodeServiceClientType = NodeServiceClient<
@@ -165,6 +166,7 @@ pub fn internode_rpc_max_message_size() -> usize {
 pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SIZE + 1024;
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v2\0";
+pub const TIER_MUTATION_CONTROL_PROTOCOL_VERSION: u32 = 1;
 
 pub fn heal_control_coordinator_epoch(topology_fingerprint: &str) -> Result<u64, &'static str> {
     let prefix = topology_fingerprint
@@ -249,6 +251,155 @@ pub fn canonical_heal_control_response_body(
     body.extend_from_slice(&u64::try_from(result.len())?.to_be_bytes());
     body.extend_from_slice(result);
     Ok(body)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TierMutationPeerRpcKind {
+    Prepare,
+    Commit,
+    Abort,
+}
+
+impl TierMutationPeerRpcKind {
+    fn domain(self) -> &'static [u8] {
+        match self {
+            Self::Prepare => b"rustfs-tier-mutation-peer-prepare-v1\0",
+            Self::Commit => b"rustfs-tier-mutation-peer-commit-v1\0",
+            Self::Abort => b"rustfs-tier-mutation-peer-abort-v1\0",
+        }
+    }
+}
+
+fn push_len_prefixed(body: &mut Vec<u8>, value: &[u8], field: &str) -> std::io::Result<()> {
+    let len = u64::try_from(value.len()).map_err(|_| std::io::Error::other(format!("{field} length cannot be represented")))?;
+    body.extend_from_slice(&len.to_be_bytes());
+    body.extend_from_slice(value);
+    Ok(())
+}
+
+struct TierMutationPeerCanonicalInput<'a> {
+    kind: TierMutationPeerRpcKind,
+    version: u32,
+    mutation_id: &'a Uuid,
+    revision: u64,
+    topology_fingerprint: &'a [u8],
+    field_a: &'a [u8],
+    field_b: &'a [u8],
+    deadline_unix_millis: u64,
+}
+
+fn canonical_tier_mutation_peer_request_body(input: TierMutationPeerCanonicalInput<'_>) -> std::io::Result<Vec<u8>> {
+    if input.mutation_id.is_nil() {
+        return Err(std::io::Error::other("tier mutation id is nil"));
+    }
+    if input.revision == 0 {
+        return Err(std::io::Error::other("tier mutation revision is zero"));
+    }
+    if input.topology_fingerprint.is_empty() {
+        return Err(std::io::Error::other("tier mutation topology fingerprint is empty"));
+    }
+    if input.deadline_unix_millis == 0 {
+        return Err(std::io::Error::other("tier mutation deadline is zero"));
+    }
+    let mut body = Vec::with_capacity(
+        input.kind.domain().len()
+            + 4
+            + 16
+            + 8
+            + 8
+            + input.topology_fingerprint.len()
+            + 8
+            + input.field_a.len()
+            + 8
+            + input.field_b.len()
+            + 8,
+    );
+    body.extend_from_slice(input.kind.domain());
+    body.extend_from_slice(&input.version.to_be_bytes());
+    body.extend_from_slice(input.mutation_id.as_bytes());
+    body.extend_from_slice(&input.revision.to_be_bytes());
+    push_len_prefixed(&mut body, input.topology_fingerprint, "tier mutation topology fingerprint")?;
+    push_len_prefixed(&mut body, input.field_a, "tier mutation field")?;
+    push_len_prefixed(&mut body, input.field_b, "tier mutation field")?;
+    body.extend_from_slice(&input.deadline_unix_millis.to_be_bytes());
+    Ok(body)
+}
+
+pub fn canonical_tier_mutation_prepare_request_body(
+    version: u32,
+    mutation_id: &Uuid,
+    revision: u64,
+    topology_fingerprint: &[u8],
+    intent_record: &[u8],
+    intent_record_etag: &str,
+    deadline_unix_millis: u64,
+) -> std::io::Result<Vec<u8>> {
+    if intent_record.is_empty() {
+        return Err(std::io::Error::other("tier mutation intent record is empty"));
+    }
+    if intent_record_etag.is_empty() {
+        return Err(std::io::Error::other("tier mutation intent record etag is empty"));
+    }
+    canonical_tier_mutation_peer_request_body(TierMutationPeerCanonicalInput {
+        kind: TierMutationPeerRpcKind::Prepare,
+        version,
+        mutation_id,
+        revision,
+        topology_fingerprint,
+        field_a: intent_record,
+        field_b: intent_record_etag.as_bytes(),
+        deadline_unix_millis,
+    })
+}
+
+pub fn canonical_tier_mutation_commit_request_body(
+    version: u32,
+    mutation_id: &Uuid,
+    revision: u64,
+    topology_fingerprint: &[u8],
+    committed_config_etag: &str,
+    committed_config_digest: &[u8],
+    deadline_unix_millis: u64,
+) -> std::io::Result<Vec<u8>> {
+    if committed_config_etag.is_empty() {
+        return Err(std::io::Error::other("tier mutation committed config etag is empty"));
+    }
+    if committed_config_digest.is_empty() {
+        return Err(std::io::Error::other("tier mutation committed config digest is empty"));
+    }
+    canonical_tier_mutation_peer_request_body(TierMutationPeerCanonicalInput {
+        kind: TierMutationPeerRpcKind::Commit,
+        version,
+        mutation_id,
+        revision,
+        topology_fingerprint,
+        field_a: committed_config_etag.as_bytes(),
+        field_b: committed_config_digest,
+        deadline_unix_millis,
+    })
+}
+
+pub fn canonical_tier_mutation_abort_request_body(
+    version: u32,
+    mutation_id: &Uuid,
+    revision: u64,
+    topology_fingerprint: &[u8],
+    abort_reason: &str,
+    deadline_unix_millis: u64,
+) -> std::io::Result<Vec<u8>> {
+    if abort_reason.is_empty() {
+        return Err(std::io::Error::other("tier mutation abort reason is empty"));
+    }
+    canonical_tier_mutation_peer_request_body(TierMutationPeerCanonicalInput {
+        kind: TierMutationPeerRpcKind::Abort,
+        version,
+        mutation_id,
+        revision,
+        topology_fingerprint,
+        field_a: abort_reason.as_bytes(),
+        field_b: &[],
+        deadline_unix_millis,
+    })
 }
 
 #[cfg(test)]
@@ -360,6 +511,251 @@ mod heal_control_tests {
             assert!(execution > Duration::ZERO);
             assert!(execution < normalized_transport);
         }
+    }
+}
+
+#[cfg(test)]
+mod tier_mutation_control_tests {
+    use super::{
+        TIER_MUTATION_CONTROL_PROTOCOL_VERSION, canonical_tier_mutation_abort_request_body,
+        canonical_tier_mutation_commit_request_body, canonical_tier_mutation_prepare_request_body,
+    };
+    use crate::proto_gen::node_service::tier_mutation_control_service_server::SERVICE_NAME as TIER_MUTATION_CONTROL_SERVICE_NAME;
+    use uuid::Uuid;
+
+    #[test]
+    fn tier_mutation_prepare_body_is_stable_and_field_bound() {
+        let mutation_id = Uuid::from_u128(0x12345678123456781234567812345678);
+        let body = canonical_tier_mutation_prepare_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            7,
+            b"topology-a",
+            b"intent-record-v1",
+            "etag-a",
+            1_725_000_000_123,
+        )
+        .expect("prepare body should encode");
+        let same = canonical_tier_mutation_prepare_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            7,
+            b"topology-a",
+            b"intent-record-v1",
+            "etag-a",
+            1_725_000_000_123,
+        )
+        .expect("prepare body should encode deterministically");
+        assert_eq!(body, same);
+
+        let changed_record = canonical_tier_mutation_prepare_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            7,
+            b"topology-a",
+            b"intent-record-v2",
+            "etag-a",
+            1_725_000_000_123,
+        )
+        .expect("prepare body should encode");
+        assert_ne!(body, changed_record);
+
+        let changed_etag = canonical_tier_mutation_prepare_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            7,
+            b"topology-a",
+            b"intent-record-v1",
+            "etag-b",
+            1_725_000_000_123,
+        )
+        .expect("prepare body should encode");
+        assert_ne!(body, changed_etag);
+    }
+
+    #[test]
+    fn tier_mutation_prepare_body_matches_golden_wire_contract() {
+        let mutation_id = Uuid::from_u128(0x12345678123456781234567812345678);
+        let body = canonical_tier_mutation_prepare_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            7,
+            b"topology-a",
+            b"intent-record-v1",
+            "etag-a",
+            1_725_000_000_123,
+        )
+        .expect("prepare body should encode");
+        let mut expected = b"rustfs-tier-mutation-peer-prepare-v1\0".to_vec();
+        expected.extend_from_slice(&TIER_MUTATION_CONTROL_PROTOCOL_VERSION.to_be_bytes());
+        expected.extend_from_slice(mutation_id.as_bytes());
+        expected.extend_from_slice(&7_u64.to_be_bytes());
+        expected.extend_from_slice(&10_u64.to_be_bytes());
+        expected.extend_from_slice(b"topology-a");
+        expected.extend_from_slice(&16_u64.to_be_bytes());
+        expected.extend_from_slice(b"intent-record-v1");
+        expected.extend_from_slice(&6_u64.to_be_bytes());
+        expected.extend_from_slice(b"etag-a");
+        expected.extend_from_slice(&1_725_000_000_123_u64.to_be_bytes());
+
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn tier_mutation_rpc_phases_have_distinct_canonical_domains() {
+        let mutation_id = Uuid::from_u128(0x12345678123456781234567812345678);
+        let prepare = canonical_tier_mutation_prepare_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            8,
+            b"topology-a",
+            b"intent-record-v1",
+            "etag-a",
+            1_725_000_000_123,
+        )
+        .expect("prepare body should encode");
+        let commit = canonical_tier_mutation_commit_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            8,
+            b"topology-a",
+            "config-etag-a",
+            b"config-digest-a",
+            1_725_000_000_123,
+        )
+        .expect("commit body should encode");
+        let abort = canonical_tier_mutation_abort_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            8,
+            b"topology-a",
+            "coordinator failed before CAS",
+            1_725_000_000_123,
+        )
+        .expect("abort body should encode");
+
+        assert_ne!(prepare, commit);
+        assert_ne!(prepare, abort);
+        assert_ne!(commit, abort);
+    }
+
+    #[test]
+    fn tier_mutation_commit_body_binds_config_proof_and_deadline() {
+        let mutation_id = Uuid::from_u128(0x12345678123456781234567812345678);
+        let body = canonical_tier_mutation_commit_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            9,
+            b"topology-a",
+            "config-etag-a",
+            b"config-digest-a",
+            1_725_000_000_123,
+        )
+        .expect("commit body should encode");
+        let changed_digest = canonical_tier_mutation_commit_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            9,
+            b"topology-a",
+            "config-etag-a",
+            b"config-digest-b",
+            1_725_000_000_123,
+        )
+        .expect("commit body should encode");
+        let changed_deadline = canonical_tier_mutation_commit_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            9,
+            b"topology-a",
+            "config-etag-a",
+            b"config-digest-a",
+            1_725_000_000_124,
+        )
+        .expect("commit body should encode");
+
+        assert_ne!(body, changed_digest);
+        assert_ne!(body, changed_deadline);
+    }
+
+    #[test]
+    fn tier_mutation_body_rejects_missing_authoritative_proof_fields() {
+        let mutation_id = Uuid::from_u128(0x12345678123456781234567812345678);
+
+        let nil_id = canonical_tier_mutation_prepare_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &Uuid::nil(),
+            1,
+            b"topology-a",
+            b"intent-record-v1",
+            "etag-a",
+            1,
+        )
+        .expect_err("nil mutation id must fail closed");
+        assert_eq!(nil_id.to_string(), "tier mutation id is nil");
+
+        let zero_revision = canonical_tier_mutation_prepare_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            0,
+            b"topology-a",
+            b"intent-record-v1",
+            "etag-a",
+            1,
+        )
+        .expect_err("zero revision must fail closed");
+        assert_eq!(zero_revision.to_string(), "tier mutation revision is zero");
+
+        let empty_topology = canonical_tier_mutation_prepare_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            1,
+            b"",
+            b"intent-record-v1",
+            "etag-a",
+            1,
+        )
+        .expect_err("empty topology proof must fail closed");
+        assert_eq!(empty_topology.to_string(), "tier mutation topology fingerprint is empty");
+
+        let empty_prepare_record = canonical_tier_mutation_prepare_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            1,
+            b"topology-a",
+            b"",
+            "etag-a",
+            1,
+        )
+        .expect_err("empty prepare record must fail closed");
+        assert_eq!(empty_prepare_record.to_string(), "tier mutation intent record is empty");
+
+        let empty_commit_digest = canonical_tier_mutation_commit_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            1,
+            b"topology-a",
+            "config-etag-a",
+            b"",
+            1,
+        )
+        .expect_err("empty commit digest must fail closed");
+        assert_eq!(empty_commit_digest.to_string(), "tier mutation committed config digest is empty");
+
+        let empty_abort_reason = canonical_tier_mutation_abort_request_body(
+            TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            1,
+            b"topology-a",
+            "",
+            1,
+        )
+        .expect_err("empty abort reason must fail closed");
+        assert_eq!(empty_abort_reason.to_string(), "tier mutation abort reason is empty");
+    }
+
+    #[test]
+    fn generated_tier_mutation_service_name_is_contract_anchor() {
+        assert_eq!(TIER_MUTATION_CONTROL_SERVICE_NAME, "node_service.TierMutationControlService");
     }
 }
 

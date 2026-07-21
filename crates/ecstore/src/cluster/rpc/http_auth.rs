@@ -1145,6 +1145,84 @@ mod tests {
     }
 
     #[test]
+    fn tier_mutation_peer_rpc_auth_binds_exact_method_and_body() {
+        ensure_test_rpc_secret();
+        let mutation_id = Uuid::new_v4();
+        let service = rustfs_protos::proto_gen::node_service::tier_mutation_control_service_server::SERVICE_NAME;
+        let prepare_path = format!("/{service}/Prepare");
+        let commit_path = format!("/{service}/Commit");
+        let abort_path = format!("/{service}/Abort");
+        let prepare_body = rustfs_protos::canonical_tier_mutation_prepare_request_body(
+            rustfs_protos::TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            11,
+            b"topology-a",
+            b"prepared-intent-record",
+            "intent-etag-a",
+            1_725_000_000_123,
+        )
+        .expect("prepare canonical body should encode");
+        let commit_body = rustfs_protos::canonical_tier_mutation_commit_request_body(
+            rustfs_protos::TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            11,
+            b"topology-a",
+            "config-etag-a",
+            b"config-digest-a",
+            1_725_000_000_123,
+        )
+        .expect("commit canonical body should encode");
+        let mut request = tonic::Request::new(());
+        set_tonic_canonical_body_digest(&mut request, &prepare_body).expect("canonical digest should be attached");
+        let content_sha256 = request
+            .metadata()
+            .get(RPC_CONTENT_SHA256_HEADER)
+            .and_then(|value| value.to_str().ok());
+        let headers = gen_tonic_signature_headers("node-a:9000", service, "Prepare", content_sha256)
+            .expect("tier mutation auth headers should build");
+        request.metadata_mut().as_mut().extend(headers.clone());
+
+        let replay_to_commit = verify_tonic_rpc_signature("node-a:9000", &commit_path, &headers)
+            .expect_err("prepare metadata must not authorize commit");
+        assert_eq!(replay_to_commit.to_string(), "Invalid RPC v2 signature");
+        let replay_to_abort = verify_tonic_rpc_signature("node-a:9000", &abort_path, &headers)
+            .expect_err("prepare metadata must not authorize abort");
+        assert_eq!(replay_to_abort.to_string(), "Invalid RPC v2 signature");
+        assert!(verify_tonic_rpc_signature("node-a:9000", &prepare_path, &headers).is_ok());
+        assert!(verify_tonic_canonical_body_digest(&request, &prepare_body).is_ok());
+        let tampered =
+            verify_tonic_canonical_body_digest(&request, &commit_body).expect_err("commit body must not satisfy prepare digest");
+        assert_eq!(tampered.to_string(), "RPC content SHA-256 mismatch");
+    }
+
+    #[test]
+    fn tier_mutation_peer_rpc_requires_signed_body_digest() {
+        ensure_test_rpc_secret();
+        let mutation_id = Uuid::new_v4();
+        let service = rustfs_protos::proto_gen::node_service::tier_mutation_control_service_server::SERVICE_NAME;
+        let prepare_path = format!("/{service}/Prepare");
+        let prepare_body = rustfs_protos::canonical_tier_mutation_prepare_request_body(
+            rustfs_protos::TIER_MUTATION_CONTROL_PROTOCOL_VERSION,
+            &mutation_id,
+            12,
+            b"topology-a",
+            b"prepared-intent-record",
+            "intent-etag-a",
+            1_725_000_000_123,
+        )
+        .expect("prepare canonical body should encode");
+        let headers =
+            gen_tonic_signature_headers("node-a:9000", service, "Prepare", None).expect("unsigned v2 headers should build");
+        let mut request = tonic::Request::new(());
+        request.metadata_mut().as_mut().extend(headers.clone());
+
+        assert!(verify_tonic_rpc_signature("node-a:9000", &prepare_path, &headers).is_ok());
+        let missing_body_binding = verify_tonic_canonical_body_digest(&request, &prepare_body)
+            .expect_err("tier mutation RPC must not accept an unsigned payload");
+        assert_eq!(missing_body_binding.to_string(), "RPC body is not bound to the signature");
+    }
+
+    #[test]
     fn partial_v2_metadata_fails_closed() {
         ensure_test_rpc_secret();
         let mut headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).expect("legacy auth headers should build");
